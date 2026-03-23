@@ -14,19 +14,20 @@ from pydantic import BaseModel
 import socketio, uvicorn
 
 # ── Конфиг ───────────────────────────────────────────────────
-SECRET   = os.environ.get("JWT_SECRET", secrets.token_hex(32))
-ALGO     = "HS256"
-PORT     = int(os.environ.get("PORT", 8000))
+SECRET  = os.environ.get("JWT_SECRET", secrets.token_hex(32))
+ALGO    = "HS256"
+PORT    = int(os.environ.get("PORT", 8000))
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
-    "postgresql://postgres:kh-eR3a3xfUV3YM@db.vgtvhythxizlxyktjamd.supabase.co:5432/postgres"
+    "postgresql://postgres.vgtvhythxizlxyktjamd:kh-eR3a3xfUV3YM@aws-1-eu-west-1.pooler.supabase.com:5432/postgres"
 )
 
 bearer = HTTPBearer(auto_error=False)
 
 # ── БД ───────────────────────────────────────────────────────
 def get_conn():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor,
+                            connect_timeout=10)
 
 @contextmanager
 def db():
@@ -88,11 +89,9 @@ def init_db():
             PRIMARY KEY(user_id, message_id)
         );
         INSERT INTO users(email,nickname,password_hash,is_bot)
-            VALUES('q@bot.local','q','x',1)
-            ON CONFLICT DO NOTHING;
+            VALUES('q@bot.local','q','x',1) ON CONFLICT DO NOTHING;
         INSERT INTO users(email,nickname,password_hash,is_bot)
-            VALUES('w@bot.local','w','x',1)
-            ON CONFLICT DO NOTHING;
+            VALUES('w@bot.local','w','x',1) ON CONFLICT DO NOTHING;
         """)
 
 init_db()
@@ -134,7 +133,8 @@ def get_chat_with_recipient(cur, chat_id: int, user_id: int):
         FROM chats c JOIN chat_participants cp ON c.id=cp.chat_id
         WHERE c.id=%s AND cp.user_id=%s
     """, (user_id, user_id, chat_id, user_id))
-    return dict(cur.fetchone())
+    row = cur.fetchone()
+    return dict(row) if row else {}
 
 # ── FastAPI ───────────────────────────────────────────────────
 app = FastAPI(docs_url="/docs")
@@ -258,7 +258,8 @@ def create_chat(b: Chat, u=Depends(me)):
         for pid in ids:
             kd=(b.encryptedKeys or {}).get(str(pid),{})
             cur.execute(
-                "INSERT INTO chat_participants(chat_id,user_id,encrypted_key,iv) VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                "INSERT INTO chat_participants(chat_id,user_id,encrypted_key,iv) "
+                "VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING",
                 (cid,pid,kd.get("wrappedKey",""),kd.get("iv","")))
         return get_chat_with_recipient(cur, cid, u["id"])
 
@@ -268,7 +269,8 @@ def delete_chat(cid: int, u=Depends(me)):
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM chat_participants WHERE chat_id=%s AND user_id=%s",(cid,u["id"]))
         if not cur.fetchone(): raise HTTPException(403)
-        cur.execute("DELETE FROM saved_messages WHERE message_id IN (SELECT id FROM messages WHERE chat_id=%s)",(cid,))
+        cur.execute("DELETE FROM saved_messages WHERE message_id IN "
+                    "(SELECT id FROM messages WHERE chat_id=%s)",(cid,))
         cur.execute("DELETE FROM messages WHERE chat_id=%s",(cid,))
         cur.execute("DELETE FROM chat_participants WHERE chat_id=%s",(cid,))
         cur.execute("DELETE FROM chats WHERE id=%s",(cid,))
@@ -281,7 +283,8 @@ def saved_msgs(u=Depends(me)):
         cur.execute("""
             SELECT m.*,u.nickname as sender_nickname,u.is_bot as sender_is_bot
             FROM saved_messages sm JOIN messages m ON sm.message_id=m.id
-            JOIN users u ON m.sender_id=u.id WHERE sm.user_id=%s ORDER BY m.timestamp DESC
+            JOIN users u ON m.sender_id=u.id
+            WHERE sm.user_id=%s ORDER BY m.timestamp DESC
         """,(u["id"],))
         return [dict(r) for r in cur.fetchall()]
 
@@ -314,23 +317,28 @@ def get_parts(cid: int, u=Depends(me)):
 def fav(cid: int, u=Depends(me)):
     with db() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT is_favorite FROM chat_participants WHERE chat_id=%s AND user_id=%s",(cid,u["id"]))
+        cur.execute("SELECT is_favorite FROM chat_participants WHERE chat_id=%s AND user_id=%s",
+                    (cid,u["id"]))
         r = cur.fetchone()
         if not r: raise HTTPException(403)
         new = 0 if r["is_favorite"] else 1
-        cur.execute("UPDATE chat_participants SET is_favorite=%s WHERE chat_id=%s AND user_id=%s",(new,cid,u["id"]))
+        cur.execute("UPDATE chat_participants SET is_favorite=%s WHERE chat_id=%s AND user_id=%s",
+                    (new,cid,u["id"]))
         return {"is_favorite":bool(new)}
 
 @app.post("/api/chats/messages/{mid}/save")
 def save_msg(mid: int, u=Depends(me)):
     with db() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM saved_messages WHERE user_id=%s AND message_id=%s",(u["id"],mid))
+        cur.execute("SELECT 1 FROM saved_messages WHERE user_id=%s AND message_id=%s",
+                    (u["id"],mid))
         if cur.fetchone():
-            cur.execute("DELETE FROM saved_messages WHERE user_id=%s AND message_id=%s",(u["id"],mid))
+            cur.execute("DELETE FROM saved_messages WHERE user_id=%s AND message_id=%s",
+                        (u["id"],mid))
             return {"is_saved":False}
         else:
-            cur.execute("INSERT INTO saved_messages VALUES(%s,%s) ON CONFLICT DO NOTHING",(u["id"],mid))
+            cur.execute("INSERT INTO saved_messages VALUES(%s,%s) ON CONFLICT DO NOTHING",
+                        (u["id"],mid))
             return {"is_saved":True}
 
 # ── Socket.IO ─────────────────────────────────────────────────
@@ -384,14 +392,15 @@ async def send_message(sid, data, callback=None):
         if not cur.fetchone():
             if callback: callback({"status":"error"}); return
         cur.execute(
-            "INSERT INTO messages(chat_id,sender_id,encrypted_text,ciphertext,iv,ratchet_key,signature,counter)"
-            " VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            "INSERT INTO messages(chat_id,sender_id,encrypted_text,ciphertext,iv,"
+            "ratchet_key,signature,counter) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
             (cid,uid,ct,ct,iv,rat,sig,ctr))
         mid=cur.fetchone()["id"]
         cur.execute("SELECT nickname FROM users WHERE id=%s",(uid,))
         nick=cur.fetchone()["nickname"]
         cur.execute("SELECT u.id,u.nickname FROM chat_participants cp "
-                    "JOIN users u ON cp.user_id=u.id WHERE cp.chat_id=%s AND u.is_bot=1",(cid,))
+                    "JOIN users u ON cp.user_id=u.id "
+                    "WHERE cp.chat_id=%s AND u.is_bot=1",(cid,))
         bots=cur.fetchall()
 
     msg={"id":mid,"chat_id":cid,"sender_id":uid,"sender_nickname":nick,"sender_is_bot":0,
@@ -405,13 +414,17 @@ async def send_message(sid, data, callback=None):
         text=random.choice(BOTS.get(bot["nickname"],["I'm a bot!"]))
         with db() as conn:
             cur=conn.cursor()
-            cur.execute("INSERT INTO messages(chat_id,sender_id,encrypted_text,ciphertext,iv)"
-                        " VALUES(%s,%s,%s,%s,%s) RETURNING id",(cid,bot["id"],text,text,"BOT"))
+            cur.execute(
+                "INSERT INTO messages(chat_id,sender_id,encrypted_text,ciphertext,iv)"
+                " VALUES(%s,%s,%s,%s,%s) RETURNING id",
+                (cid,bot["id"],text,text,"BOT"))
             bid=cur.fetchone()["id"]
-        await sio.emit("new_message",{"id":bid,"chat_id":cid,"sender_id":bot["id"],
+        await sio.emit("new_message",{
+            "id":bid,"chat_id":cid,"sender_id":bot["id"],
             "sender_nickname":bot["nickname"],"sender_is_bot":1,
             "encrypted_text":text,"ciphertext":text,"iv":"BOT",
-            "timestamp":datetime.utcnow().isoformat(),"attachments":[]},room=f"chat_{cid}")
+            "timestamp":datetime.utcnow().isoformat(),"attachments":[]},
+            room=f"chat_{cid}")
 
 # ── Сборка и запуск ───────────────────────────────────────────
 from socketio import ASGIApp

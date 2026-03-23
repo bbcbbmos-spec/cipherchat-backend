@@ -3,3 +3,4 @@ uvicorn[standard]
 python-jose[cryptography]
 werkzeug
 python-socketio[asyncio]
+psycopg2-binary

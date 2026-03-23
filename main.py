@@ -5,13 +5,15 @@ from contextlib import contextmanager
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile, File, Form
 from fastapi.responses import Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from werkzeug.security import generate_password_hash, check_password_hash
 from jose import jwt, JWTError
 from pydantic import BaseModel
 import socketio, uvicorn
+import cloudinary
+import cloudinary.uploader
 
 # ── Конфиг ───────────────────────────────────────────────────
 SECRET  = os.environ.get("JWT_SECRET", secrets.token_hex(32))
@@ -20,6 +22,14 @@ PORT    = int(os.environ.get("PORT", 8000))
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql://postgres.vgtvhythxizlxyktjamd:kh-eR3a3xfUV3YM@aws-1-eu-west-1.pooler.supabase.com:5432/postgres"
+)
+
+# ── Cloudinary ───────────────────────────────────────────────
+cloudinary.config(
+    cloud_name = os.environ.get("CLOUDINARY_CLOUD", "dodyg9o4l"),
+    api_key    = os.environ.get("CLOUDINARY_KEY",   "493872698929697"),
+    api_secret = os.environ.get("CLOUDINARY_SECRET","sHn-WOD2FcLiPS-LepaIPFs-y1E"),
+    secure     = True
 )
 
 bearer = HTTPBearer(auto_error=False)
@@ -82,6 +92,13 @@ def init_db():
             signature TEXT,
             counter INTEGER DEFAULT 0,
             is_read BOOLEAN DEFAULT FALSE,
+            message_type TEXT DEFAULT 'text',
+            file_url TEXT,
+            file_name TEXT,
+            file_size INTEGER,
+            file_type TEXT,
+            thumbnail_url TEXT,
+            duration INTEGER,
             timestamp TIMESTAMP DEFAULT NOW()
         );
         CREATE TABLE IF NOT EXISTS saved_messages(
@@ -94,8 +111,14 @@ def init_db():
         INSERT INTO users(email,nickname,password_hash,is_bot)
             VALUES('w@bot.local','w','x',1) ON CONFLICT DO NOTHING;
 
-        -- Добавляем is_read если таблица уже существовала без него
         ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE;
+        ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_type TEXT DEFAULT 'text';
+        ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_url TEXT;
+        ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_name TEXT;
+        ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_size INTEGER;
+        ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_type TEXT;
+        ALTER TABLE messages ADD COLUMN IF NOT EXISTS thumbnail_url TEXT;
+        ALTER TABLE messages ADD COLUMN IF NOT EXISTS duration INTEGER;
         """)
 
 init_db()
@@ -140,6 +163,12 @@ def get_chat_with_recipient(cur, chat_id: int, user_id: int):
     row = cur.fetchone()
     return dict(row) if row else {}
 
+def determine_message_type(content_type: str) -> str:
+    if content_type.startswith("image/"): return "image"
+    if content_type.startswith("video/"): return "video"
+    if content_type.startswith("audio/"): return "voice"
+    return "file"
+
 # ── FastAPI ───────────────────────────────────────────────────
 app = FastAPI(docs_url="/docs")
 
@@ -162,6 +191,96 @@ def health(): return {"ok": True}
 
 @app.get("/")
 def root(): return {"status": "ok"}
+
+# ── ЗАГРУЗКА ФАЙЛА ────────────────────────────────────────────
+@app.post("/api/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    chat_id: int = Form(...),
+    u=Depends(me)
+):
+    # Проверяем что пользователь участник чата
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM chat_participants WHERE chat_id=%s AND user_id=%s",
+                    (chat_id, u["id"]))
+        if not cur.fetchone(): raise HTTPException(403)
+
+    content = await file.read()
+    content_type = file.content_type or "application/octet-stream"
+    msg_type = determine_message_type(content_type)
+
+    # Определяем resource_type для Cloudinary
+    if msg_type == "image":
+        resource_type = "image"
+    elif msg_type in ("video", "voice"):
+        resource_type = "video"
+    else:
+        resource_type = "raw"
+
+    # Загружаем в Cloudinary
+    try:
+        result = cloudinary.uploader.upload(
+            content,
+            resource_type=resource_type,
+            folder=f"cipherchat/{chat_id}",
+            public_id=f"{u['id']}_{int(datetime.utcnow().timestamp())}",
+            overwrite=True
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Upload failed: {str(e)}")
+
+    file_url = result.get("secure_url")
+    thumbnail_url = None
+
+    # Для видео генерируем превью
+    if msg_type == "video":
+        public_id = result.get("public_id")
+        thumbnail_url = cloudinary.utils.cloudinary_url(
+            public_id,
+            resource_type="video",
+            format="jpg",
+            transformation=[{"width": 300, "height": 300, "crop": "fill"}]
+        )[0]
+
+    # Сохраняем сообщение в БД
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO messages(
+                chat_id,sender_id,encrypted_text,ciphertext,iv,
+                message_type,file_url,file_name,file_size,file_type,thumbnail_url
+            ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+        """, (
+            chat_id, u["id"],
+            file_url, file_url, "FILE",
+            msg_type, file_url,
+            file.filename, len(content),
+            content_type, thumbnail_url
+        ))
+        mid = cur.fetchone()["id"]
+        cur.execute("SELECT nickname FROM users WHERE id=%s", (u["id"],))
+        nick = cur.fetchone()["nickname"]
+
+    msg = {
+        "id": mid, "chat_id": chat_id,
+        "sender_id": u["id"], "sender_nickname": nick, "sender_is_bot": 0,
+        "encrypted_text": file_url, "ciphertext": file_url,
+        "iv": "FILE", "is_read": False,
+        "message_type": msg_type,
+        "file_url": file_url,
+        "file_name": file.filename,
+        "file_size": len(content),
+        "file_type": content_type,
+        "thumbnail_url": thumbnail_url,
+        "timestamp": datetime.utcnow().isoformat(),
+        "attachments": []
+    }
+
+    # Отправляем через Socket.IO в чат
+    await sio.emit("new_message", msg, room=f"chat_{chat_id}")
+
+    return msg
 
 # ── AUTH ──────────────────────────────────────────────────────
 @app.post("/api/auth/register")
@@ -307,14 +426,12 @@ def get_msgs(cid: int, u=Depends(me)):
         """,(u["id"],cid))
         return [dict(r) for r in cur.fetchall()]
 
-# ── ПРОЧИТАНО — отмечаем все сообщения чата как прочитанные ──
 @app.post("/api/chats/{cid}/read")
 def mark_read(cid: int, u=Depends(me)):
     with db() as conn:
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM chat_participants WHERE chat_id=%s AND user_id=%s",(cid,u["id"]))
         if not cur.fetchone(): raise HTTPException(403)
-        # Отмечаем как прочитанные все сообщения НЕ от текущего пользователя
         cur.execute("""
             UPDATE messages SET is_read=TRUE
             WHERE chat_id=%s AND sender_id!=%s AND is_read=FALSE
@@ -397,14 +514,12 @@ async def join_chat(sid, chat_id):
         cur.execute("SELECT 1 FROM chat_participants WHERE chat_id=%s AND user_id=%s",(chat_id,uid))
         if cur.fetchone():
             await sio.enter_room(sid,f"chat_{chat_id}")
-            # Отмечаем сообщения как прочитанные при входе в чат
             cur.execute("""
                 UPDATE messages SET is_read=TRUE
                 WHERE chat_id=%s AND sender_id!=%s AND is_read=FALSE
                 RETURNING id, sender_id
             """, (chat_id, uid))
             read_rows = cur.fetchall()
-            # Уведомляем отправителей что их сообщения прочитаны
             for row in read_rows:
                 sender_sid = us.get(row["sender_id"])
                 if sender_sid:
@@ -427,7 +542,6 @@ async def send_message(sid, data, callback=None):
         cur.execute("SELECT 1 FROM chat_participants WHERE chat_id=%s AND user_id=%s",(cid,uid))
         if not cur.fetchone():
             if callback: callback({"status":"error"}); return
-
         cur.execute(
             "INSERT INTO messages(chat_id,sender_id,encrypted_text,ciphertext,iv,"
             "ratchet_key,signature,counter,is_read) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,FALSE) RETURNING id",
@@ -439,26 +553,19 @@ async def send_message(sid, data, callback=None):
                     "JOIN users u ON cp.user_id=u.id "
                     "WHERE cp.chat_id=%s AND u.is_bot=1",(cid,))
         bots=cur.fetchall()
-
-        # Проверяем есть ли собеседник онлайн в этом чате
         cur.execute("SELECT user_id FROM chat_participants WHERE chat_id=%s AND user_id!=%s",
                     (cid, uid))
         other_users = cur.fetchall()
 
-    # Проверяем онлайн ли собеседник
-    is_read = False
-    for other in other_users:
-        if other["user_id"] in us:
-            is_read = True
-            # Отмечаем как прочитанное сразу
-            with db() as conn:
-                cur = conn.cursor()
-                cur.execute("UPDATE messages SET is_read=TRUE WHERE id=%s", (mid,))
-            break
+    is_read = any(o["user_id"] in us for o in other_users)
+    if is_read:
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute("UPDATE messages SET is_read=TRUE WHERE id=%s", (mid,))
 
     msg={"id":mid,"chat_id":cid,"sender_id":uid,"sender_nickname":nick,"sender_is_bot":0,
          "encrypted_text":ct,"ciphertext":ct,"iv":iv,"signature":sig,"ratchet_key":rat,
-         "counter":ctr,"is_read":is_read,
+         "counter":ctr,"is_read":is_read,"message_type":"text",
          "timestamp":datetime.utcnow().isoformat(),"attachments":[]}
     await sio.emit("new_message",msg,room=f"chat_{cid}")
     if callback: callback({"status":"ok","id":mid})
@@ -477,6 +584,7 @@ async def send_message(sid, data, callback=None):
             "id":bid,"chat_id":cid,"sender_id":bot["id"],
             "sender_nickname":bot["nickname"],"sender_is_bot":1,
             "encrypted_text":text,"ciphertext":text,"iv":"BOT","is_read":False,
+            "message_type":"text",
             "timestamp":datetime.utcnow().isoformat(),"attachments":[]},
             room=f"chat_{cid}")
 

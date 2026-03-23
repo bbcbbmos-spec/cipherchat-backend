@@ -81,6 +81,7 @@ def init_db():
             ratchet_key TEXT,
             signature TEXT,
             counter INTEGER DEFAULT 0,
+            is_read BOOLEAN DEFAULT FALSE,
             timestamp TIMESTAMP DEFAULT NOW()
         );
         CREATE TABLE IF NOT EXISTS saved_messages(
@@ -92,6 +93,9 @@ def init_db():
             VALUES('q@bot.local','q','x',1) ON CONFLICT DO NOTHING;
         INSERT INTO users(email,nickname,password_hash,is_bot)
             VALUES('w@bot.local','w','x',1) ON CONFLICT DO NOTHING;
+
+        -- Добавляем is_read если таблица уже существовала без него
+        ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE;
         """)
 
 init_db()
@@ -303,6 +307,22 @@ def get_msgs(cid: int, u=Depends(me)):
         """,(u["id"],cid))
         return [dict(r) for r in cur.fetchall()]
 
+# ── ПРОЧИТАНО — отмечаем все сообщения чата как прочитанные ──
+@app.post("/api/chats/{cid}/read")
+def mark_read(cid: int, u=Depends(me)):
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM chat_participants WHERE chat_id=%s AND user_id=%s",(cid,u["id"]))
+        if not cur.fetchone(): raise HTTPException(403)
+        # Отмечаем как прочитанные все сообщения НЕ от текущего пользователя
+        cur.execute("""
+            UPDATE messages SET is_read=TRUE
+            WHERE chat_id=%s AND sender_id!=%s AND is_read=FALSE
+            RETURNING id
+        """, (cid, u["id"]))
+        read_ids = [r["id"] for r in cur.fetchall()]
+        return {"read_message_ids": read_ids}
+
 @app.get("/api/chats/{cid}/participants")
 def get_parts(cid: int, u=Depends(me)):
     with db() as conn:
@@ -377,6 +397,22 @@ async def join_chat(sid, chat_id):
         cur.execute("SELECT 1 FROM chat_participants WHERE chat_id=%s AND user_id=%s",(chat_id,uid))
         if cur.fetchone():
             await sio.enter_room(sid,f"chat_{chat_id}")
+            # Отмечаем сообщения как прочитанные при входе в чат
+            cur.execute("""
+                UPDATE messages SET is_read=TRUE
+                WHERE chat_id=%s AND sender_id!=%s AND is_read=FALSE
+                RETURNING id, sender_id
+            """, (chat_id, uid))
+            read_rows = cur.fetchall()
+            # Уведомляем отправителей что их сообщения прочитаны
+            for row in read_rows:
+                sender_sid = us.get(row["sender_id"])
+                if sender_sid:
+                    await sio.emit("messages_read", {
+                        "chat_id": chat_id,
+                        "message_id": row["id"],
+                        "read_by": uid
+                    }, to=sender_sid)
 
 @sio.event
 async def send_message(sid, data, callback=None):
@@ -391,9 +427,10 @@ async def send_message(sid, data, callback=None):
         cur.execute("SELECT 1 FROM chat_participants WHERE chat_id=%s AND user_id=%s",(cid,uid))
         if not cur.fetchone():
             if callback: callback({"status":"error"}); return
+
         cur.execute(
             "INSERT INTO messages(chat_id,sender_id,encrypted_text,ciphertext,iv,"
-            "ratchet_key,signature,counter) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            "ratchet_key,signature,counter,is_read) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,FALSE) RETURNING id",
             (cid,uid,ct,ct,iv,rat,sig,ctr))
         mid=cur.fetchone()["id"]
         cur.execute("SELECT nickname FROM users WHERE id=%s",(uid,))
@@ -403,9 +440,26 @@ async def send_message(sid, data, callback=None):
                     "WHERE cp.chat_id=%s AND u.is_bot=1",(cid,))
         bots=cur.fetchall()
 
+        # Проверяем есть ли собеседник онлайн в этом чате
+        cur.execute("SELECT user_id FROM chat_participants WHERE chat_id=%s AND user_id!=%s",
+                    (cid, uid))
+        other_users = cur.fetchall()
+
+    # Проверяем онлайн ли собеседник
+    is_read = False
+    for other in other_users:
+        if other["user_id"] in us:
+            is_read = True
+            # Отмечаем как прочитанное сразу
+            with db() as conn:
+                cur = conn.cursor()
+                cur.execute("UPDATE messages SET is_read=TRUE WHERE id=%s", (mid,))
+            break
+
     msg={"id":mid,"chat_id":cid,"sender_id":uid,"sender_nickname":nick,"sender_is_bot":0,
          "encrypted_text":ct,"ciphertext":ct,"iv":iv,"signature":sig,"ratchet_key":rat,
-         "counter":ctr,"timestamp":datetime.utcnow().isoformat(),"attachments":[]}
+         "counter":ctr,"is_read":is_read,
+         "timestamp":datetime.utcnow().isoformat(),"attachments":[]}
     await sio.emit("new_message",msg,room=f"chat_{cid}")
     if callback: callback({"status":"ok","id":mid})
 
@@ -422,7 +476,7 @@ async def send_message(sid, data, callback=None):
         await sio.emit("new_message",{
             "id":bid,"chat_id":cid,"sender_id":bot["id"],
             "sender_nickname":bot["nickname"],"sender_is_bot":1,
-            "encrypted_text":text,"ciphertext":text,"iv":"BOT",
+            "encrypted_text":text,"ciphertext":text,"iv":"BOT","is_read":False,
             "timestamp":datetime.utcnow().isoformat(),"attachments":[]},
             room=f"chat_{cid}")
 
